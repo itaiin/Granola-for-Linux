@@ -129,10 +129,19 @@ BS3="$INSTALL_DIR/resources/app.asar.unpacked/node_modules/better-sqlite3-multip
 BS3_VER="$(node -p "require('$BS3/package.json').version")"
 info "building Granola's fork of v$BS3_VER from source"
 
-cp -r "$BS3" "$WORK/bs3"
 ( cd "$WORK" && npm pack "better-sqlite3-multiple-ciphers@$BS3_VER" --silent >/dev/null \
     && tar xzf better-sqlite3-multiple-ciphers-*.tgz ) || die "could not fetch binding.gyp from npm"
-cp "$WORK/package/binding.gyp" "$WORK/bs3/"
+if [[ -d "$BS3/src" && -d "$BS3/deps" ]]; then
+  cp -r "$BS3" "$WORK/bs3"
+  cp "$WORK/package/binding.gyp" "$WORK/bs3/"
+else
+  # Newer Granola builds ship only the macOS binary, not the C++ source.
+  # Rebuild from upstream npm source with updateHook() patched back in.
+  info "no C++ source in bundle; patching upstream npm source instead"
+  mv "$WORK/package" "$WORK/bs3"
+  python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/patch-update-hook.py" "$WORK/bs3" \
+    || die "could not patch updateHook into better-sqlite3 source"
+fi
 
 ( cd "$WORK/bs3" && CC="$CC" CXX="$CXX" npx --yes node-gyp rebuild --release \
     --runtime=electron --target="$EL_VER" --arch=x64 \
@@ -171,6 +180,25 @@ command -v update-desktop-database >/dev/null && update-desktop-database "$(dirn
 command -v xdg-mime >/dev/null && xdg-mime default "$(basename "$DESKTOP_FILE")" x-scheme-handler/granola 2>/dev/null || true
 
 
+step "Configuring the Chromium sandbox"
+
+# Ubuntu 23.10+ (and others) block unprivileged user namespaces via AppArmor,
+# so Electron falls back to the setuid helper, which must be root-owned 4755
+# or the app aborts at launch with "SUID sandbox helper ... not configured".
+if [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" == 1 \
+      || "$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null)" == 0 ]]; then
+  info "unprivileged user namespaces are restricted; chrome-sandbox needs root:4755 (sudo)"
+  if sudo chown root:root "$INSTALL_DIR/chrome-sandbox" && sudo chmod 4755 "$INSTALL_DIR/chrome-sandbox"; then
+    info "chrome-sandbox configured"
+  else
+    info "WARNING: could not set up chrome-sandbox; run manually:"
+    info "  sudo chown root:root '$INSTALL_DIR/chrome-sandbox' && sudo chmod 4755 '$INSTALL_DIR/chrome-sandbox'"
+  fi
+else
+  info "user namespaces available, nothing to do"
+fi
+
+
 step "Smoke-testing the native module"
 
 ELECTRON_RUN_AS_NODE=1 NODE_PATH="$INSTALL_DIR/resources/app.asar/node_modules" \
@@ -185,9 +213,10 @@ ELECTRON_RUN_AS_NODE=1 NODE_PATH="$INSTALL_DIR/resources/app.asar/node_modules" 
     db.prepare('INSERT INTO t VALUES (1)').run();
     if (db.prepare('SELECT count(*) c FROM t').get().c !== 1) throw new Error('insert failed');
     if (!fired) throw new Error('updateHook did not fire');
+    db.prepare(\"SELECT * FROM tables_used('SELECT * FROM t')\").all();
     db.close();
   " || die "smoke test failed, the app would not start"
-info "encrypted database + updateHook both work"
+info "encrypted database + updateHook + tables_used all work"
 
 printf '\n\033[32m✓ Granola %s is installed.\033[0m\n' "$APP_VER"
 printf '  Launch it from your application menu, or run:\n    %s\n\n' "$INSTALL_DIR/granola.sh"
