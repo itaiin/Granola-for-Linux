@@ -4,7 +4,8 @@ set -euo pipefail
 
 DMG="${1:-}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/Applications/granola}"
-CACHE_DIR="${CACHE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.cache}"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CACHE_DIR="${CACHE_DIR:-$REPO_DIR/.cache}"
 DESKTOP_FILE="${DESKTOP_FILE:-$HOME/.local/share/applications/granola.desktop}"
 RES="Granola/Granola.app/Contents/Resources"
 
@@ -21,7 +22,7 @@ mkdir -p "$CACHE_DIR"
 
 step "Checking prerequisites"
 
-for cmd in node npm python3 curl make; do
+for cmd in node npm python3 curl make patch; do
   command -v "$cmd" >/dev/null || die "'$cmd' not found. Please install it."
 done
 
@@ -116,31 +117,37 @@ print(f"    rewrote {total} platform fallback(s)")
 PYEOF
 
 
-step "Rebuilding better-sqlite3-multiple-ciphers for Linux"
+step "Building better-sqlite3-multiple-ciphers for Linux"
 
-# Granola ships a *patched* fork of better-sqlite3-multiple-ciphers: it adds an
-# updateHook() method that the renderer's cache layer calls on startup. Upstream
-# npm builds do not have it, so dropping in a stock prebuilt binary gets you a
-# window that dies with "r.updateHook is not a function".
+# Granola ships a private build of better-sqlite3-multiple-ciphers with two
+# additions its renderer needs: db.updateHook() (the cache layer calls it on
+# startup) and SQLITE_ENABLE_BYTECODE_VTAB (live queries read `tables_used`).
+# A stock build dies with "updateHook is not a function" or "no such table:
+# tables_used", and newer Granola releases no longer bundle their source.
 #
-# Their full C++ source is inside app.asar.unpacked, so build *that*. Only
-# binding.gyp is missing from the bundle; take it from the matching npm release.
+# So: take a pinned upstream release, apply patches/better-sqlite3-granola.patch,
+# and replace the whole module (JS + native) so both halves match. 13.x uses
+# Node-API, which is ABI-stable, so one build works with any Electron version.
+BS3_UPSTREAM="${BS3_UPSTREAM:-13.2.0}"
 BS3="$INSTALL_DIR/resources/app.asar.unpacked/node_modules/better-sqlite3-multiple-ciphers"
-BS3_VER="$(node -p "require('$BS3/package.json').version")"
-info "building Granola's fork of v$BS3_VER from source"
+info "Granola bundles v$(node -p "require('$BS3/package.json').version"); building patched upstream v$BS3_UPSTREAM"
 
-cp -r "$BS3" "$WORK/bs3"
-( cd "$WORK" && npm pack "better-sqlite3-multiple-ciphers@$BS3_VER" --silent >/dev/null \
-    && tar xzf better-sqlite3-multiple-ciphers-*.tgz ) || die "could not fetch binding.gyp from npm"
-cp "$WORK/package/binding.gyp" "$WORK/bs3/"
+( cd "$WORK" && npm pack "better-sqlite3-multiple-ciphers@$BS3_UPSTREAM" --silent >/dev/null \
+    && tar xzf better-sqlite3-multiple-ciphers-*.tgz && mv package bs3 ) \
+  || die "could not download better-sqlite3-multiple-ciphers@$BS3_UPSTREAM from npm"
+patch -d "$WORK/bs3" -p1 --forward --quiet < "$REPO_DIR/patches/better-sqlite3-granola.patch" \
+  || die "patch did not apply to v$BS3_UPSTREAM; pin BS3_UPSTREAM to a version it supports"
 
-( cd "$WORK/bs3" && CC="$CC" CXX="$CXX" npx --yes node-gyp rebuild --release \
-    --runtime=electron --target="$EL_VER" --arch=x64 \
-    --dist-url=https://electronjs.org/headers ) >"$WORK/build.log" 2>&1 \
+( cd "$WORK/bs3" \
+    && npm install --omit=dev --ignore-scripts --no-audit --no-fund --silent \
+    && CC="$CC" CXX="$CXX" npx --yes node-gyp rebuild --release --force_build=1 ) >"$WORK/build.log" 2>&1 \
   || { tail -30 "$WORK/build.log"; die "native build failed (full log: $WORK/build.log)"; }
 
-cp "$WORK/bs3/build/Release/better_sqlite3.node" \
-   "$WORK/bs3/build/Release/test_extension.node" "$BS3/build/Release/"
+rm -rf "$BS3"
+mkdir -p "$BS3/build/Release"
+cp -r "$WORK/bs3/package.json" "$WORK/bs3/lib" "$WORK/bs3/LICENSE" "$BS3/"
+cp "$WORK/bs3/build/Release/better_sqlite3.node" "$WORK/bs3/build/Release/test_extension.node" \
+   "$BS3/build/Release/"
 
 
 step "Installing launcher and desktop entry"
@@ -171,6 +178,25 @@ command -v update-desktop-database >/dev/null && update-desktop-database "$(dirn
 command -v xdg-mime >/dev/null && xdg-mime default "$(basename "$DESKTOP_FILE")" x-scheme-handler/granola 2>/dev/null || true
 
 
+step "Configuring the Chromium sandbox"
+
+# Ubuntu 23.10+ (and others) block unprivileged user namespaces via AppArmor,
+# so Electron falls back to the setuid helper, which must be root-owned 4755
+# or the app aborts at launch with "SUID sandbox helper ... not configured".
+if [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" == 1 \
+      || "$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null)" == 0 ]]; then
+  info "unprivileged user namespaces are restricted; chrome-sandbox needs root:4755 (sudo)"
+  if sudo chown root:root "$INSTALL_DIR/chrome-sandbox" && sudo chmod 4755 "$INSTALL_DIR/chrome-sandbox"; then
+    info "chrome-sandbox configured"
+  else
+    info "WARNING: could not set up chrome-sandbox; run manually:"
+    info "  sudo chown root:root '$INSTALL_DIR/chrome-sandbox' && sudo chmod 4755 '$INSTALL_DIR/chrome-sandbox'"
+  fi
+else
+  info "user namespaces available, nothing to do"
+fi
+
+
 step "Smoke-testing the native module"
 
 ELECTRON_RUN_AS_NODE=1 NODE_PATH="$INSTALL_DIR/resources/app.asar/node_modules" \
@@ -185,9 +211,10 @@ ELECTRON_RUN_AS_NODE=1 NODE_PATH="$INSTALL_DIR/resources/app.asar/node_modules" 
     db.prepare('INSERT INTO t VALUES (1)').run();
     if (db.prepare('SELECT count(*) c FROM t').get().c !== 1) throw new Error('insert failed');
     if (!fired) throw new Error('updateHook did not fire');
+    db.prepare(\"SELECT * FROM tables_used('SELECT * FROM t')\").all();
     db.close();
   " || die "smoke test failed, the app would not start"
-info "encrypted database + updateHook both work"
+info "encrypted database + updateHook + tables_used all work"
 
 printf '\n\033[32m✓ Granola %s is installed.\033[0m\n' "$APP_VER"
 printf '  Launch it from your application menu, or run:\n    %s\n\n' "$INSTALL_DIR/granola.sh"

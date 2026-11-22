@@ -1,0 +1,135 @@
+diff --git a/deps/defines.gypi b/deps/defines.gypi
+index 990b4b3..3bcfadd 100644
+--- a/deps/defines.gypi
++++ b/deps/defines.gypi
+@@ -28,6 +28,7 @@
+     'SQLITE_ENABLE_PERCENTILE',
+     'SQLITE_ENABLE_RTREE',
+     'SQLITE_ENABLE_STAT4',
++    'SQLITE_ENABLE_BYTECODE_VTAB',
+     'SQLITE_ENABLE_UPDATE_DELETE_LIMIT',
+     'SQLITE_LIKE_DOESNT_MATCH_BLOBS',
+     'SQLITE_OMIT_DEPRECATED',
+diff --git a/lib/database.js b/lib/database.js
+index 73d81bd..5ad5c5b 100644
+--- a/lib/database.js
++++ b/lib/database.js
+@@ -88,6 +88,7 @@ module.exports = function createDatabase(getAddon, allowNativeBinding) {
+ 	Database.prototype.close = wrappers.close;
+ 	Database.prototype.defaultSafeIntegers = wrappers.defaultSafeIntegers;
+ 	Database.prototype.unsafeMode = wrappers.unsafeMode;
++	Database.prototype.updateHook = wrappers.updateHook;
+ 	Database.prototype[util.inspect] = require('./methods/inspect');
+ 
+ 	return Database;
+diff --git a/lib/methods/wrappers.js b/lib/methods/wrappers.js
+index 72fc119..df72f94 100644
+--- a/lib/methods/wrappers.js
++++ b/lib/methods/wrappers.js
+@@ -40,6 +40,11 @@ exports.unsafeMode = function unsafeMode(...args) {
+ 	return this;
+ };
+ 
++exports.updateHook = function updateHook(...args) {
++	this[cppdb].updateHook(...args);
++	return this;
++};
++
+ exports.getters = {
+ 	name: {
+ 		get: function name() { return this[cppdb].name; },
+diff --git a/src/objects/database.cpp b/src/objects/database.cpp
+index 09619d7..7bed8b6 100644
+--- a/src/objects/database.cpp
++++ b/src/objects/database.cpp
+@@ -22,7 +22,9 @@ Database::Database(const Napi::CallbackInfo& info) :
+ 	addon(static_cast<Addon*>(info.Data())),
+ 	logger(),
+ 	stmts(),
+-	backups() {
++	backups(),
++	update_hook(),
++	update_hook_env(NULL) {
+ 	TYPE_TAG_CONSTRUCTOR(info);
+ 	JS_new(info);
+ }
+@@ -40,6 +42,8 @@ void Database::CloseHandles() {
+ 		for (Backup* backup : backups) backup->CloseHandles();
+ 		stmts.clear();
+ 		backups.clear();
++		sqlite3_update_hook(db_handle, NULL, NULL);
++		update_hook.Reset();
+ 		int status = sqlite3_close(db_handle);
+ 		assert(status == SQLITE_OK); ((void)status);
+ 	}
+@@ -137,6 +141,7 @@ INIT(Database::Init) {
+ 		PrototypeMethod<Database, &Database::JS_close>("close", addon),
+ 		PrototypeMethod<Database, &Database::JS_defaultSafeIntegers>("defaultSafeIntegers", addon),
+ 		PrototypeMethod<Database, &Database::JS_unsafeMode>("unsafeMode", addon),
++		PrototypeMethod<Database, &Database::JS_updateHook>("updateHook", addon),
+ 	}, addon);
+ }
+ 
+@@ -490,3 +495,42 @@ NODE_GETTER(Database::JS_inTransaction) {
+ 	UNWRAP_OR_RETURN(Database, db, info.This());
+ 	return Napi::Boolean::New(info.Env(), db->open && !static_cast<bool>(sqlite3_get_autocommit(db->db_handle)));
+ }
++
++// db.updateHook(fn | null): fn(op, dbName, table, rowid) runs after every row
++// insert/update/delete, via sqlite3_update_hook(). Not part of upstream; Granola
++// ships this addition in its private build and its cache layer depends on it.
++NODE_METHOD(Database::JS_updateHook) {
++	UNWRAP_OR_RETURN(Database, db, info.This());
++	REQUIRE_DATABASE_OPEN(db);
++	if (info.Length() == 0 || info[0].IsNull() || info[0].IsUndefined()) {
++		sqlite3_update_hook(db->db_handle, NULL, NULL);
++		db->update_hook.Reset();
++		return info.Env().Undefined();
++	}
++	REQUIRE_ARGUMENT_FUNCTION(first, Napi::Function fn);
++	db->update_hook = Napi::Persistent(fn);
++	db->update_hook_env = info.Env();
++	sqlite3_update_hook(db->db_handle, UpdateHookCallback, db);
++	return info.Env().Undefined();
++}
++
++// Runs synchronously inside sqlite3_step() on the JS thread. An exception
++// thrown by the callback cannot propagate through SQLite, so it is cleared.
++void Database::UpdateHookCallback(void* self, int op, const char* db_name, const char* table, sqlite3_int64 rowid) {
++	Database* db = static_cast<Database*>(self);
++	if (db->update_hook.IsEmpty()) return;
++	Napi::Env env(db->update_hook_env);
++	Napi::HandleScope scope(env);
++	const char* op_name = op == SQLITE_INSERT ? "insert" : op == SQLITE_UPDATE ? "update" : "delete";
++	napi_value args[4] = {
++		StringFromUtf8(env, op_name, -1),
++		StringFromUtf8(env, db_name, -1),
++		StringFromUtf8(env, table, -1),
++		Napi::Number::New(env, static_cast<double>(rowid)),
++	};
++	SafeCall(env, db->update_hook.Value(), env.Undefined(), 4, args);
++	if (env.IsExceptionPending()) {
++		napi_value ignored;
++		napi_get_and_clear_last_exception(env, &ignored);
++	}
++}
+diff --git a/src/objects/database.hpp b/src/objects/database.hpp
+index edf6d0a..1d8ef76 100644
+--- a/src/objects/database.hpp
++++ b/src/objects/database.hpp
+@@ -78,6 +78,8 @@ private:
+ 	static NODE_METHOD(JS_close);
+ 	static NODE_METHOD(JS_defaultSafeIntegers);
+ 	static NODE_METHOD(JS_unsafeMode);
++	static NODE_METHOD(JS_updateHook);
++	static void UpdateHookCallback(void* self, int op, const char* db_name, const char* table, sqlite3_int64 rowid);
+ 	static NODE_GETTER(JS_open);
+ 	static NODE_GETTER(JS_inTransaction);
+ 
+@@ -99,4 +101,6 @@ private:
+ 	Napi::Reference<Napi::Value> logger;
+ 	std::set<Statement*, CompareStatement> stmts;
+ 	std::set<Backup*, CompareBackup> backups;
++	Napi::FunctionReference update_hook;
++	napi_env update_hook_env;
+ };
