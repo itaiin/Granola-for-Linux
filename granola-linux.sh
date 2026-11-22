@@ -4,7 +4,8 @@ set -euo pipefail
 
 DMG="${1:-}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/Applications/granola}"
-CACHE_DIR="${CACHE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.cache}"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CACHE_DIR="${CACHE_DIR:-$REPO_DIR/.cache}"
 DESKTOP_FILE="${DESKTOP_FILE:-$HOME/.local/share/applications/granola.desktop}"
 RES="Granola/Granola.app/Contents/Resources"
 
@@ -21,7 +22,7 @@ mkdir -p "$CACHE_DIR"
 
 step "Checking prerequisites"
 
-for cmd in node npm python3 curl make; do
+for cmd in node npm python3 curl make patch; do
   command -v "$cmd" >/dev/null || die "'$cmd' not found. Please install it."
 done
 
@@ -116,40 +117,37 @@ print(f"    rewrote {total} platform fallback(s)")
 PYEOF
 
 
-step "Rebuilding better-sqlite3-multiple-ciphers for Linux"
+step "Building better-sqlite3-multiple-ciphers for Linux"
 
-# Granola ships a *patched* fork of better-sqlite3-multiple-ciphers: it adds an
-# updateHook() method that the renderer's cache layer calls on startup. Upstream
-# npm builds do not have it, so dropping in a stock prebuilt binary gets you a
-# window that dies with "r.updateHook is not a function".
+# Granola ships a private build of better-sqlite3-multiple-ciphers with two
+# additions its renderer needs: db.updateHook() (the cache layer calls it on
+# startup) and SQLITE_ENABLE_BYTECODE_VTAB (live queries read `tables_used`).
+# A stock build dies with "updateHook is not a function" or "no such table:
+# tables_used", and newer Granola releases no longer bundle their source.
 #
-# Their full C++ source is inside app.asar.unpacked, so build *that*. Only
-# binding.gyp is missing from the bundle; take it from the matching npm release.
+# So: take a pinned upstream release, apply patches/better-sqlite3-granola.patch,
+# and replace the whole module (JS + native) so both halves match. 13.x uses
+# Node-API, which is ABI-stable, so one build works with any Electron version.
+BS3_UPSTREAM="${BS3_UPSTREAM:-13.2.0}"
 BS3="$INSTALL_DIR/resources/app.asar.unpacked/node_modules/better-sqlite3-multiple-ciphers"
-BS3_VER="$(node -p "require('$BS3/package.json').version")"
-info "building Granola's fork of v$BS3_VER from source"
+info "Granola bundles v$(node -p "require('$BS3/package.json').version"); building patched upstream v$BS3_UPSTREAM"
 
-( cd "$WORK" && npm pack "better-sqlite3-multiple-ciphers@$BS3_VER" --silent >/dev/null \
-    && tar xzf better-sqlite3-multiple-ciphers-*.tgz ) || die "could not fetch binding.gyp from npm"
-if [[ -d "$BS3/src" && -d "$BS3/deps" ]]; then
-  cp -r "$BS3" "$WORK/bs3"
-  cp "$WORK/package/binding.gyp" "$WORK/bs3/"
-else
-  # Newer Granola builds ship only the macOS binary, not the C++ source.
-  # Rebuild from upstream npm source with updateHook() patched back in.
-  info "no C++ source in bundle; patching upstream npm source instead"
-  mv "$WORK/package" "$WORK/bs3"
-  python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/patch-update-hook.py" "$WORK/bs3" \
-    || die "could not patch updateHook into better-sqlite3 source"
-fi
+( cd "$WORK" && npm pack "better-sqlite3-multiple-ciphers@$BS3_UPSTREAM" --silent >/dev/null \
+    && tar xzf better-sqlite3-multiple-ciphers-*.tgz && mv package bs3 ) \
+  || die "could not download better-sqlite3-multiple-ciphers@$BS3_UPSTREAM from npm"
+patch -d "$WORK/bs3" -p1 --forward --quiet < "$REPO_DIR/patches/better-sqlite3-granola.patch" \
+  || die "patch did not apply to v$BS3_UPSTREAM; pin BS3_UPSTREAM to a version it supports"
 
-( cd "$WORK/bs3" && CC="$CC" CXX="$CXX" npx --yes node-gyp rebuild --release \
-    --runtime=electron --target="$EL_VER" --arch=x64 \
-    --dist-url=https://electronjs.org/headers ) >"$WORK/build.log" 2>&1 \
+( cd "$WORK/bs3" \
+    && npm install --omit=dev --ignore-scripts --no-audit --no-fund --silent \
+    && CC="$CC" CXX="$CXX" npx --yes node-gyp rebuild --release --force_build=1 ) >"$WORK/build.log" 2>&1 \
   || { tail -30 "$WORK/build.log"; die "native build failed (full log: $WORK/build.log)"; }
 
-cp "$WORK/bs3/build/Release/better_sqlite3.node" \
-   "$WORK/bs3/build/Release/test_extension.node" "$BS3/build/Release/"
+rm -rf "$BS3"
+mkdir -p "$BS3/build/Release"
+cp -r "$WORK/bs3/package.json" "$WORK/bs3/lib" "$WORK/bs3/LICENSE" "$BS3/"
+cp "$WORK/bs3/build/Release/better_sqlite3.node" "$WORK/bs3/build/Release/test_extension.node" \
+   "$BS3/build/Release/"
 
 
 step "Installing launcher and desktop entry"

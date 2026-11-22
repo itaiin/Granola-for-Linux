@@ -39,8 +39,7 @@ If you would rather not run the script, the conversion takes six steps:
 3. Unzip the Linux runtime into your install folder and delete `resources/default_app.asar`.
 4. Copy `app.asar`, `app.asar.unpacked`, and `icons/` from the bundle into the runtime's `resources/`. Skip every Mac binary, since they all sit behind `darwin` checks.
 5. Patch the platform string inside `app.asar` so it reports `Windows`. Granola's API returns a 500 error for `platform=linux`, so sign-in fails without this.
-6. Rebuild `better-sqlite3-multiple-ciphers` from the C++ source inside `app.asar.unpacked` using g++ 11 or newer. Granola's version adds an `updateHook()` that no public build has.
-   Newer Granola builds (7.7xx+) ship only the macOS binary, not the source. In that case `patch-update-hook.py` rebuilds from the matching npm release. It adds `updateHook()`, turns on `SQLITE_ENABLE_BYTECODE_VTAB` (Granola's live queries read the `tables_used` virtual table, and the UI dies without it), and adds shims for V8 15 (Electron 45+).
+6. Build `better-sqlite3-multiple-ciphers` from a pinned upstream release (13.2.0) with `patches/better-sqlite3-granola.patch` applied, and replace the bundled module with it. Granola's private build adds two things the app needs: a `db.updateHook()` method, and `SQLITE_ENABLE_BYTECODE_VTAB` (its live queries read the `tables_used` virtual table). Newer Granola releases no longer bundle that source. 13.x uses Node-API, so one build works with any Electron version. Override the version with `BS3_UPSTREAM=`.
 
 Four of those six fail with errors that do not point at the real cause. `granola-linux.sh` has the exact commands, with comments explaining each one.
 
